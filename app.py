@@ -3,7 +3,7 @@ import io
 import base64
 import json
 import time
-import hashlib
+import logging
 import warnings
 import traceback
 import numpy as np
@@ -21,10 +21,47 @@ from reportlab.platypus import (
     Image as RLImage, Table, TableStyle, HRFlowable
 )
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
+from utils.gradcam import GradCAMError, generate_gradcam as generate_real_gradcam
+from utils.image_processing import (
+    ImageValidationError,
+    check_image_quality as run_image_quality_check,
+    load_image_from_bytes,
+    validate_extension,
+)
+from utils.model_loader import (
+    IMG_SIZE,
+    InferenceError,
+    ModelLoadError,
+    TORCH_AVAILABLE,
+    get_device_name,
+    load_class_names,
+    predict_image,
+)
+from utils.mri_validator import validate_brain_mri
+from utils.report_helper import (
+    DISCLAIMER,
+    build_clinical_summary as build_dynamic_clinical_summary,
+    build_second_opinion as build_dynamic_second_opinion,
+    get_tumor_info as get_dynamic_tumor_info,
+)
 
 warnings.filterwarnings('ignore')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s: %(message)s')
 
 BASE_DIR = os.path.abspath(os.path.dirname(__file__))
+
+
+def make_json_safe(value):
+    """Convert NumPy scalars/arrays into native JSON-serializable Python values."""
+    if isinstance(value, dict):
+        return {str(key): make_json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [make_json_safe(item) for item in value]
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    return value
 
 # ── Optional PyTorch ──────────────────────────────────────────────────────────
 try:
@@ -285,81 +322,15 @@ def check_image_quality(image):
 
 
 # ── Simulation Prediction ─────────────────────────────────────────────────────
-def simulate_prediction(image):
-    """
-    Deterministic simulated prediction (consistent for same image bytes).
-    Replace the body of this function with real model inference when available.
-    """
-    img_bytes = np.array(image).tobytes()
-    seed = int(hashlib.md5(img_bytes).hexdigest(), 16) % (2**31)
-    rng  = np.random.default_rng(seed)
-
-    probs = rng.dirichlet([2.5, 1.5, 1.2, 1.8])
-    preds = {cls: float(p * 100) for cls, p in zip(CLASS_NAMES, probs)}
-    top_class   = max(preds, key=preds.get)
-    top_conf    = preds[top_class]
-
-    model_ensemble = {
-        'ResNet-50':       min(100, top_conf + float(rng.uniform(-3, 3))),
-        'EfficientNet-B4': min(100, top_conf + float(rng.uniform(-3, 3))),
-        'Vision Transformer': min(100, top_conf + float(rng.uniform(-3, 3)))
-    }
-
-    return {
-        'prediction':       top_class,
-        'confidence':       top_conf,
-        'all_predictions':  preds,
-        'model_predictions': model_ensemble
-    }
+ 
 
 
 # ── Grad-CAM ──────────────────────────────────────────────────────────────────
-def generate_gradcam(image, predicted_class):
-    """
-    Produce a Grad-CAM attention heatmap.
-    In simulation mode a spatially-plausible heatmap is generated;
-    swap for real gradient-based Grad-CAM when the trained model is loaded.
-    """
-    img_array = np.array(image.resize((IMG_SIZE, IMG_SIZE)))
-
-    # Simulate a spatially-plausible hotspot rather than pure noise
-    cx = IMG_SIZE // 2 + np.random.randint(-40, 40)
-    cy = IMG_SIZE // 2 + np.random.randint(-40, 40)
-    Y, X = np.ogrid[:IMG_SIZE, :IMG_SIZE]
-    # Gaussian blob centred on (cx, cy)
-    sigma = np.random.randint(40, 80)
-    gauss = np.exp(-((X - cx)**2 + (Y - cy)**2) / (2 * sigma**2))
-    noise = np.random.rand(IMG_SIZE, IMG_SIZE) * 0.25
-    heatmap_raw = np.clip(gauss + noise, 0, 1)
-
-    heatmap_uint8 = np.uint8(255 * heatmap_raw)
-    heatmap_color = cv2.applyColorMap(heatmap_uint8, cv2.COLORMAP_JET)
-    overlay       = cv2.addWeighted(
-        cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR), 0.55,
-        heatmap_color, 0.45, 0
-    )
-    return heatmap_color, overlay
+ 
 
 
 # ── Second Opinion Generator ──────────────────────────────────────────────────
-def build_second_opinion(prediction, confidence, tumor_info):
-    tmpl = SECOND_OPINION.get(prediction, SECOND_OPINION['No Tumor'])
-    return {
-        'prediction':         prediction,
-        'confidence':         confidence,
-        'reasoning':          tmpl['reasoning'],
-        'severity':           tumor_info['severity'],
-        'severity_rationale': tmpl['severity_rationale'],
-        'symptoms':           tumor_info['symptoms'],
-        'specialist':         tumor_info.get('specialist', 'Neurologist'),
-        'recommended_tests':  tmpl['additional_tests'],
-        'follow_up':          tmpl['follow_up'],
-        'disclaimer': (
-            'This AI-generated second opinion is for informational purposes only '
-            'and must not replace professional medical diagnosis. Always consult '
-            'qualified healthcare professionals.'
-        )
-    }
+ 
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -378,52 +349,87 @@ def predict():
     """Analyse uploaded MRI and return full clinical inference payload."""
     try:
         if 'image' not in request.files:
-            return jsonify({'error': 'No image file provided'}), 400
+            return jsonify({'error': 'No image file provided', 'code': 'EMPTY_UPLOAD'}), 400
 
         file = request.files['image']
         if not file.filename:
-            return jsonify({'error': 'Empty filename'}), 400
+            return jsonify({'error': 'Empty filename', 'code': 'EMPTY_FILENAME'}), 400
 
-        raw   = file.read()
-        image = PILImage.open(io.BytesIO(raw)).convert('RGB')
+        validate_extension(file.filename)
+        raw = file.read()
+        image = load_image_from_bytes(raw)
 
         # Quality gate
-        quality = check_image_quality(image)
+        quality = run_image_quality_check(image)
         if not quality['suitable']:
-            return jsonify({'error': 'Image quality check failed', 'quality_check': quality}), 400
+            return jsonify({
+                'error': 'Image quality check failed',
+                'code': 'IMAGE_QUALITY_FAILED',
+                'quality_check': quality
+            }), 400
+
+        # MRI validation gate
+        mri_validation = validate_brain_mri(image)
+        if not mri_validation['accepted']:
+            return jsonify({
+                'error': 'This is not a Brain MRI',
+                'code': 'NOT_BRAIN_MRI',
+                'quality_check': quality,
+                'mri_validation': mri_validation
+            }), 400
 
         # Inference
         t0     = time.perf_counter()
-        result = simulate_prediction(image)
+        result = predict_image(image)
         ms     = round((time.perf_counter() - t0) * 1000, 2)
 
         # Grad-CAM
-        heatmap, overlay = generate_gradcam(image, result['prediction'])
+        gradcam = generate_real_gradcam(image, result.get('class_index'))
 
         # Payload assembly
         confidence    = result['confidence']
-        tumor_info    = TUMOR_INFO.get(result['prediction'], TUMOR_INFO['No Tumor'])
-        second_opinion = build_second_opinion(result['prediction'], confidence, tumor_info)
+        tumor_info    = get_dynamic_tumor_info(result['prediction'])
+        clinical_summary = build_dynamic_clinical_summary(result['prediction'], confidence)
+        second_opinion = build_dynamic_second_opinion(result['prediction'], confidence)
 
-        return jsonify({
+        payload = {
             **result,
             'images': {
-                'original': rgb_to_b64(image),
-                'heatmap':  bgr_to_b64(heatmap),
-                'overlay':  bgr_to_b64(overlay),
+                'original': gradcam['original'],
+                'heatmap':  gradcam['heatmap'],
+                'overlay':  gradcam['overlay'],
+            },
+            'gradcam': {
+                'original': gradcam['original'],
+                'heatmap':  gradcam['heatmap'],
+                'overlay':  gradcam['overlay'],
             },
             'timestamp':          datetime.now().isoformat(),
             'inference_time':     ms,
             'quality_check':      quality,
+            'mri_validation':     mri_validation,
             'is_low_confidence':  confidence < CONFIDENCE_THRESHOLD,
             'confidence_threshold': CONFIDENCE_THRESHOLD,
+            'clinical_summary':   clinical_summary,
             'second_opinion':     second_opinion,
             'tumor_info':         tumor_info,
-        })
+        }
+        return jsonify(make_json_safe(payload))
 
+    except ImageValidationError as exc:
+        return jsonify({'error': str(exc), 'code': 'INVALID_IMAGE'}), 400
+    except ModelLoadError as exc:
+        logging.exception("Model loading failed")
+        return jsonify({'error': str(exc), 'code': 'MODEL_LOAD_ERROR'}), 503
+    except InferenceError as exc:
+        logging.exception("Inference failed")
+        return jsonify({'error': str(exc), 'code': 'INFERENCE_ERROR'}), 500
+    except GradCAMError as exc:
+        logging.exception("Grad-CAM failed")
+        return jsonify({'error': str(exc), 'code': 'GRADCAM_ERROR'}), 500
     except Exception as exc:
-        print(traceback.format_exc())
-        return jsonify({'error': str(exc)}), 500
+        logging.exception("Unexpected prediction error")
+        return jsonify({'error': 'Unexpected server error during analysis.', 'details': str(exc), 'code': 'SERVER_ERROR'}), 500
 
 
 @app.route('/api/report', methods=['POST'])
@@ -525,12 +531,14 @@ def generate_report():
         story.append(heading('AI Diagnosis Result'))
         prediction = data.get('prediction', 'Unknown')
         confidence = data.get('confidence', 0)
-        sev        = TUMOR_INFO.get(prediction, {}).get('severity', '—')
+        tumor_payload = data.get('tumor_info') or get_dynamic_tumor_info(prediction)
+        sev        = tumor_payload.get('severity', '—')
 
         dr = [
             ['Predicted Condition', prediction],
             ['AI Confidence',       f"{confidence:.1f}%"],
             ['Severity Assessment', sev],
+            ['Analysis Timestamp',  data.get('timestamp') or datetime.now().isoformat()],
         ]
         dt = Table(dr, colWidths=[1.6*inch, 4.2*inch])
         dt.setStyle(TableStyle([
@@ -548,6 +556,27 @@ def generate_report():
         ]))
         story.append(dt)
         story.append(Spacer(1, 0.2*inch))
+        probabilities = data.get('probabilities') or data.get('all_predictions') or {}
+        if probabilities:
+            story.append(heading('Probability Table', sz=12))
+            rows = [['Class', 'Probability']]
+            for cls, prob in sorted(probabilities.items(), key=lambda item: item[1], reverse=True):
+                rows.append([str(cls), f"{float(prob):.2f}%"])
+            prob_table = Table(rows, colWidths=[3.0*inch, 2.8*inch])
+            prob_table.setStyle(TableStyle([
+                ('BACKGROUND', (0,0), (-1,0), TEAL),
+                ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+                ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+                ('FONTNAME', (0,1), (-1,-1), 'Helvetica'),
+                ('FONTSIZE', (0,0), (-1,-1), 9.5),
+                ('ALIGN', (1,1), (1,-1), 'RIGHT'),
+                ('ROWBACKGROUNDS', (0,1), (-1,-1), [colors.white, colors.HexColor('#f8fafc')]),
+                ('GRID', (0,0), (-1,-1), 0.4, colors.HexColor('#e2e8f0')),
+                ('BOTTOMPADDING', (0,0), (-1,-1), 7),
+                ('TOPPADDING', (0,0), (-1,-1), 7),
+            ]))
+            story.append(prob_table)
+            story.append(Spacer(1, 0.2*inch))
         story.append(hr())
 
         # ── Images ───────────────────────────────────────────────────────────
@@ -570,7 +599,10 @@ def generate_report():
         story.append(hr())
 
         # ── Clinical sections ─────────────────────────────────────────────────
-        ti = data.get('tumor_info', {})
+        ti = tumor_payload
+        clinical_summary = data.get('clinical_summary') or build_dynamic_clinical_summary(prediction, float(confidence or 0))
+        story.append(heading('Clinical Summary'))
+        story.append(body(clinical_summary.get('summary', '—')))
         for title, key in [
             ('Clinical Observation', 'description'),
             ('Possible Symptoms',    'symptoms'),
@@ -636,12 +668,16 @@ def generate_report():
 
 @app.route('/api/health', methods=['GET'])
 def health():
+    try:
+        classes = load_class_names()
+    except Exception:
+        classes = CLASS_NAMES
     return jsonify({
         'status':          'healthy',
         'version':         '2.0.0',
-        'device':          str(DEVICE),
+        'device':          get_device_name(),
         'torch_available': TORCH_AVAILABLE,
-        'classes':         CLASS_NAMES,
+        'classes':         classes,
         'confidence_threshold': CONFIDENCE_THRESHOLD,
         'timestamp':       datetime.now().isoformat()
     })

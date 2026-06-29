@@ -1653,7 +1653,12 @@ document.getElementById('downloadBtn').addEventListener('click', async () => {
         gradcam:        currentData.images.overlay,
         prediction:     currentData.prediction,
         confidence:     currentData.confidence,
+        probabilities:  currentData.probabilities || currentData.all_predictions,
+        all_predictions: currentData.all_predictions,
         timestamp:      currentData.timestamp,
+        quality_check:  currentData.quality_check,
+        mri_validation: currentData.mri_validation,
+        clinical_summary: currentData.clinical_summary,
         second_opinion: currentData.second_opinion,
         tumor_info:     currentData.tumor_info
       })

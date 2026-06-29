@@ -1,0 +1,11 @@
+{
+    "architecture": "resnet50",
+    "num_classes": 4,
+    "image_size": 224,
+    "classes": [
+        "glioma",
+        "meningioma",
+        "notumor",
+        "pituitary"
+    ]
+}
