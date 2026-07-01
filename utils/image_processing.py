@@ -13,7 +13,7 @@ from PIL import Image, UnidentifiedImageError
 
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 MIN_RESOLUTION = 128
-MIN_SHARPNESS = 60.0
+MIN_SHARPNESS = 15.0  # Lowered from 60.0 to accommodate MRI soft tissue characteristics
 MIN_BRIGHTNESS = 12.0
 MAX_BRIGHTNESS = 245.0
 MIN_STD_DEV = 8.0

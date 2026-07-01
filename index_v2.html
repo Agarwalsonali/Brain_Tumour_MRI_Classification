@@ -1434,7 +1434,10 @@ async function analyzeImage() {
     hideLoading();
 
     if (!res.ok) {
-      if (data.error === 'Image quality check failed') {
+      if (data.code === 'NOT_BRAIN_MRI') {
+        // Professional MRI validation error message
+        showError('❌ Invalid Input\n\nThis uploaded image is not recognized as a Brain MRI scan.\n\nPlease upload a valid MRI image in JPG, JPEG or PNG format.');
+      } else if (data.error === 'Image quality check failed') {
         showError(`Image Quality: ${data.quality_check?.reason || data.error} — ${data.quality_check?.details || ''}`);
       } else {
         showError(data.error || 'Analysis failed. Check server connection.');

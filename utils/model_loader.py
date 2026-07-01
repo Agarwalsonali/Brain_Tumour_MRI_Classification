@@ -102,6 +102,62 @@ def get_preprocess_transform():
     )
 
 
+def get_inference_transforms(image_size: Tuple[int, int] | None = None):
+    """Build deterministic test-time augmentation views for robust inference."""
+    if not TORCH_AVAILABLE:
+        raise ModelLoadError("PyTorch and torchvision are not installed.")
+
+    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    inference_transforms = [
+        transforms.Compose(
+            [
+                transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        ),
+        transforms.Compose(
+            [
+                transforms.Resize((IMG_SIZE, IMG_SIZE)),
+                transforms.RandomHorizontalFlip(p=1.0),
+                transforms.ToTensor(),
+                normalize,
+            ]
+        ),
+    ]
+
+    if image_size is None:
+        return inference_transforms
+
+    width, height = image_size
+    aspect_ratio = max(width, height) / max(1, min(width, height))
+    if aspect_ratio > 1.15:
+        return inference_transforms
+
+    inference_transforms.extend(
+        [
+            transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(IMG_SIZE),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+            transforms.Compose(
+                [
+                    transforms.Resize(256),
+                    transforms.CenterCrop(IMG_SIZE),
+                    transforms.RandomHorizontalFlip(p=1.0),
+                    transforms.ToTensor(),
+                    normalize,
+                ]
+            ),
+        ]
+    )
+    return inference_transforms
+
+
 def load_model(force_reload: bool = False):
     """Load the trained ResNet50 model and cache it for future requests."""
     global _MODEL, _CLASS_NAMES, _DEVICE, _TRANSFORM
@@ -154,7 +210,25 @@ def _strip_module_prefix(state_dict: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _build_resnet_fc_head(in_features: int, num_classes: int, state_dict: Dict[str, Any]):
-    """Build the ResNet FC head shape used by the saved checkpoint."""
+    """Build the ResNet FC head shape used by the saved checkpoint.
+    
+    The training notebook uses: nn.Sequential(nn.Dropout(0.5), nn.Linear(num_features, 4))
+    This function reconstructs that exact structure.
+    """
+    # Check for the training notebook's Sequential structure: fc.0 (Dropout), fc.1 (Linear)
+    if "fc.1.weight" in state_dict and "fc.1.bias" in state_dict:
+        # This is the Sequential(Dropout, Linear) structure from training
+        out_features = int(state_dict["fc.1.weight"].shape[0])
+        if out_features != num_classes:
+            raise ModelLoadError(
+                f"Checkpoint output classes ({out_features}) do not match class_names.json ({num_classes})."
+            )
+        return nn.Sequential(
+            nn.Dropout(0.5),
+            nn.Linear(in_features, num_classes)
+        )
+    
+    # Fallback: check for simple Linear (fc.weight directly)
     if "fc.weight" in state_dict:
         out_features = int(state_dict["fc.weight"].shape[0])
         if out_features != num_classes:
@@ -163,6 +237,7 @@ def _build_resnet_fc_head(in_features: int, num_classes: int, state_dict: Dict[s
             )
         return nn.Linear(in_features, num_classes)
 
+    # Fallback: check for other Sequential structures
     linear_keys = sorted(
         key for key in state_dict
         if key.startswith("fc.") and key.endswith(".weight") and len(key.split(".")) == 3
@@ -202,14 +277,27 @@ def preprocess_image(image: Image.Image):
     return tensor
 
 
+def preprocess_inference_views(image: Image.Image):
+    """Convert an image to batched deterministic inference views."""
+    _, _, device, _ = load_model()
+    rgb_image = image.convert("RGB")
+    tensors = [transform(rgb_image) for transform in get_inference_transforms(rgb_image.size)]
+    return torch.stack(tensors).to(device)
+
+
 def predict_image(image: Image.Image) -> Dict[str, Any]:
     """Run model inference and return prediction, confidence, and probabilities."""
     try:
         model, class_names, _, _ = load_model()
-        tensor = preprocess_image(image)
+        tensor = preprocess_inference_views(image)
+        
+        # Debug logging
+        LOGGER.info(f"Input image size: {image.size}")
+        LOGGER.info(f"Inference tensor shape: {tensor.shape}")
+        
         with torch.no_grad():
             logits = model(tensor)
-            probs_tensor = F.softmax(logits, dim=1).squeeze(0).detach().cpu()
+            probs_tensor = F.softmax(logits.mean(dim=0), dim=0).detach().cpu()
 
         probabilities = {
             class_name: round(float(prob) * 100.0, 4)
@@ -218,6 +306,11 @@ def predict_image(image: Image.Image) -> Dict[str, Any]:
         class_index = int(torch.argmax(probs_tensor).item())
         prediction = class_names[class_index]
         confidence = round(float(probs_tensor[class_index]) * 100.0, 4)
+
+        # Debug logging
+        LOGGER.info(f"Predicted class: {prediction} (index: {class_index})")
+        LOGGER.info(f"Confidence: {confidence:.4f}%")
+        LOGGER.info(f"Probabilities: {probabilities}")
 
         return {
             "prediction": prediction,

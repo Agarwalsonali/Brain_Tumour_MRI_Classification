@@ -259,68 +259,6 @@ SECOND_OPINION = {
     }
 }
 
-# ── Image Quality Check ───────────────────────────────────────────────────────
-def check_image_quality(image):
-    """Validate MRI image suitability before inference."""
-    try:
-        img_array = np.array(image)
-        h, w = img_array.shape[:2]
-
-        if h < 128 or w < 128:
-            return {
-                'suitable': False,
-                'reason': 'Resolution too low',
-                'details': f'Image is {w}×{h} px — minimum required is 128×128 px.'
-            }
-
-        gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
-        lap_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-        if lap_var < 100.0:
-            return {
-                'suitable': False,
-                'reason': 'Image appears blurry',
-                'details': (
-                    f'Sharpness score {lap_var:.1f} is below the minimum threshold of 100. '
-                    'Try uploading a higher-quality scan.'
-                )
-            }
-
-        brightness = float(np.mean(gray))
-        if brightness < 30:
-            return {
-                'suitable': False,
-                'reason': 'Image too dark',
-                'details': f'Mean brightness {brightness:.1f} is below the minimum of 30.'
-            }
-        if brightness > 225:
-            return {
-                'suitable': False,
-                'reason': 'Image too bright / over-exposed',
-                'details': f'Mean brightness {brightness:.1f} exceeds the maximum of 225.'
-            }
-
-        if np.std(gray) < 5:
-            return {
-                'suitable': False,
-                'reason': 'Image may be corrupted',
-                'details': 'Very low pixel variance suggests a uniform or corrupted image.'
-            }
-
-        return {
-            'suitable': True,
-            'reason': 'Image quality acceptable',
-            'details': f'{w}×{h} px · sharpness {lap_var:.0f} · brightness {brightness:.0f}',
-            'metrics': {
-                'resolution': f'{w}×{h}',
-                'sharpness':  round(lap_var, 1),
-                'brightness': round(brightness, 1)
-            }
-        }
-    except Exception as exc:
-        return {'suitable': False, 'reason': 'Quality check error', 'details': str(exc)}
-
-
 # ── Simulation Prediction ─────────────────────────────────────────────────────
  
 
@@ -368,14 +306,19 @@ def predict():
                 'quality_check': quality
             }), 400
 
-        # MRI validation gate
+        # MRI validation gate (5-layer validation)
         mri_validation = validate_brain_mri(image)
-        if not mri_validation['accepted']:
+        if not mri_validation['valid']:
             return jsonify({
-                'error': 'This is not a Brain MRI',
+                'error': mri_validation['reason'],
                 'code': 'NOT_BRAIN_MRI',
                 'quality_check': quality,
-                'mri_validation': mri_validation
+                'mri_validation': mri_validation,
+                'validation_details': {
+                    'confidence': mri_validation['confidence'],
+                    'validation_time': mri_validation['validation_time'],
+                    'layers': mri_validation.get('layers', {})
+                }
             }), 400
 
         # Inference
